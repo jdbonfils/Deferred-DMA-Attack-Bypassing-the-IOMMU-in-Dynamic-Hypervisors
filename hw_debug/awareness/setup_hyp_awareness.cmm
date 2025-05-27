@@ -1,0 +1,23 @@
+LOCAL &pdir
+&pdir="~~/demo/zcu104_jailhouse"
+
+; Load Jailhouse symbols
+PRINT "loading Jailhouse symbols..."
+Data.LOAD.Elf &pdir/kernel/hypervisor.o H:0:::0::0 /nocode /noclear
+
+; If Trace32 runs on another machine, source path must be adapted according to your host machine's path
+sYmbol.SourcePATH.Translate "JH_WD" "C:\t32\demo\zcu104_jailhouse\"
+
+; Enable hypervisor awareness
+PRINT "loading Jailhouse awareness..."
+EXTension.LOAD ~~/demo/arm/kernel/jailhouse/jailhouse.t32 /MACHINE 0 /ACCESS H:
+TRANSlation.COMMON H:0:::0x0--0xffffffffffffffff
+
+; Configure dtb access from hypervisor awareness
+; &dtbphysical=address.offset(TRANS.PHYSICAL(1:::v.value(initial_boot_params)))
+; EXTension.jailhouse.Option DTB &dtbphysical
+
+; Debug the kernel module part of Jailhouse. The address must be changed according to the address at which the module was loaded in root cell
+PRINT "Load jailhouse kernel module symbol on the right offset: Data.LOAD.Elf jailhouse.ko NSD:0x1:::0x0::VADDR /nocode /noclear /reloctype 2"
+
+

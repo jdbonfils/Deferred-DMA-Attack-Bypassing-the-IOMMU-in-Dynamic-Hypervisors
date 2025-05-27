@@ -1,0 +1,40 @@
+LOCAL &pdir
+&pdir="~~/demo/zcu104_jailhouse"
+RESet
+SYStem.RESet
+SYStem.CPU ZYNQ-ULTRASCALE+-APU
+CORE.ASSIGN 1. 2. 3. 4.
+SYStem.Option IMASKASM ON
+SYStem.Option MMUSPACES ON
+SYStem.Option ZONESPACES ON
+SYStem.Option MACHINESPACES ON
+SYStem.Mode Attach
+
+IF STATE.RUN()
+  Break
+; Enable OS awareness in Root Cell
+DO &pdir/awareness/setup_os_awareness.cmm
+; Enable Hypervisor awareness (EL2)
+DO &pdir/awareness/setup_hyp_awareness.cmm
+
+
+; --- Setup the environement for debugging ---
+
+; Print Stage 2 Translation for the cell (VMID:2)
+MMU.List.IntermedPageTable /MACHINE 2
+; Print Hypervisor VA to Physical Address translation
+MMU.List.IntermedPageTable /MACHINE 0
+
+; Display SMMU driver function in Jailhouse called upon VM destruction
+D.L arm_smmu_cell_exit
+
+; Display SDHC control registers
+B::per , "SDIO (SD3.0/SDIO3.0/MMC4.51 Host Controller),SD1"
+ 
+; Display SMMU information related to the SDHC (SID:0x871). E.g., SDHC's intermediate page table of the IOMMU. 
+B::SMMU.StreamMapTable NSEC
+B::SMMU.StreamMapRegGrp.List NSEC 0x00000002 /IntermediatePT
+B::PER.VIEW "~~/perarmsmmu500.per" "NSEC" ANSD:0xFD800000 0x001000 0x02 D:0x0 -1 1 0 "Stream Map Register Group"
+B::PER.VIEW "~~/perarmsmmu500.per" "NSEC" ANSD:0xFD800000 0x001000 0x02 ANSD:0xFD811000 0x01 1 1 "Context Bank"
+
+ENDDO

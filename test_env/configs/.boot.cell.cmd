@@ -1,0 +1,1 @@
+cmd_/home/jean/Desktop/jh_workdir/jailhouse/configs/../../configs/boot.cell := /media/jean/work/arm-gnu-toolchain/bin/aarch64-none-linux-gnu-objcopy -O binary --remove-section=.note.gnu.property  /home/jean/Desktop/jh_workdir/jailhouse/configs/../../configs/boot.o /home/jean/Desktop/jh_workdir/jailhouse/configs/../../configs/boot.cell

